@@ -289,11 +289,12 @@ def encode_video(video_name, input_path, output_path, encoding_command, crf, pre
                             f"\rFrame: {current_frame:6d}/{total_frames:6d} | "
                             f"{progress_bar} {progress_percent:5.1f}% | "
                             f"{current_fps:3d}fps | "
+                            f"{encoding_speed:3.1f}x | "
+                            f"Bitrate: {current_bitrate:6.1f}kb/s | "
                             f"{current_size_mb:5.1f}MB / est. {estimated_final_size_mb:6.1f}MB | "
                             f"Encoded: {encoded_time} / {video_duration_formatted} | "
-                            f"est. {time_remaining} remaining | "
-                            f"{current_bitrate:6.1f}kb/s | "
-                            f"{encoding_speed:3.1f}x | "
+                            f"est. {time_remaining} remaining"
+                            
                         )
                         # Keep the line on the same line with carriage return
                         print(enhanced_progress, end='', flush=True)
