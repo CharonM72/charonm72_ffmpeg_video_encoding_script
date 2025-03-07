@@ -294,7 +294,6 @@ def encode_video(video_name, input_path, output_path, encoding_command, crf, pre
                             f"est. {time_remaining} remaining | "
                             f"{current_bitrate:6.1f}kb/s | "
                             f"{encoding_speed:3.1f}x | "
-                            f"Est. Size: {estimated_final_size_mb:6.1f}MB"
                         )
                         # Keep the line on the same line with carriage return
                         print(enhanced_progress, end='', flush=True)
