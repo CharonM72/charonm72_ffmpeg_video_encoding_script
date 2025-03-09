@@ -130,8 +130,29 @@ def get_video_info(ffmpeg_path, input_file):
         else:
             fps = float(fps_fraction)
         
-        # Parse duration
-        duration = float(probe_output[1]) if len(probe_output) > 1 else None
+        # Parse duration - handle 'N/A' case
+        duration = None
+        if len(probe_output) > 1 and probe_output[1] != 'N/A':
+            duration = float(probe_output[1])
+        
+        # If duration is None, try an alternative approach for MKV files
+        if duration is None:
+            # Try to get duration from format information instead
+            alt_probe_cmd = [
+                ffprobe_path,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0",
+                input_file
+            ]
+            
+            try:
+                alt_duration = subprocess.check_output(alt_probe_cmd, universal_newlines=True).strip()
+                if alt_duration and alt_duration != 'N/A':
+                    duration = float(alt_duration)
+            except:
+                # If that also fails, we'll continue with duration as None
+                pass
         
         # Calculate frame count from duration and fps
         frame_count = int(duration * fps) if duration and fps else None
