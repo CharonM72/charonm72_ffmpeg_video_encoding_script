@@ -1,5 +1,6 @@
 # Enhanced Video Encoding Script with AV1/HEVC Support
-# Features: GPU acceleration detection, dynamic bitrate control, progress display with time remaining
+# Features: GPU acceleration detection, dynamic bitrate control, progress display with time remaining,
+#           optional combining of multiple videos into a single encoded file
 
 import os
 import subprocess
@@ -7,7 +8,9 @@ import sys
 import math
 import shutil
 import re
+import json
 import platform
+import tempfile
 from pathlib import Path
 
 def get_validated_integer_input(prompt, default_value=None, min_value=None, max_value=None):
@@ -88,27 +91,30 @@ def find_ffmpeg_path():
     sys.exit(1)
 
 def check_gpu_acceleration(ffmpeg_path):
-    """Verify hardware acceleration support through codec list"""
+    """Check whether FFmpeg reports any hardware decoding methods"""
     try:
-        output = subprocess.check_output([ffmpeg_path, "-codecs"], stderr=subprocess.DEVNULL).decode()
-        if "hwaccel" in output:
-            print("GPU acceleration is supported.")
+        output = subprocess.check_output([ffmpeg_path, "-hide_banner", "-hwaccels"], stderr=subprocess.DEVNULL).decode()
+        # First line is a header ("Hardware acceleration methods:"), the rest are method names
+        methods = [line.strip() for line in output.splitlines()[1:] if line.strip()]
+        if methods:
+            print(f"GPU acceleration is supported ({', '.join(methods)}).")
             return True
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, OSError):
         pass
 
     print("GPU acceleration is not supported or could not be detected.")
     return False
 
+def get_ffprobe_path(ffmpeg_path):
+    """Derive the ffprobe path from the ffmpeg path (only the filename is changed, never the folders)"""
+    directory, filename = os.path.split(ffmpeg_path)
+    return os.path.join(directory, filename.replace("ffmpeg", "ffprobe", 1))
+
 def get_video_info(ffmpeg_path, input_file):
     """Extract video information using ffprobe for better efficiency"""
     try:
         # Adjust ffprobe path based on ffmpeg path
-        system = platform.system()
-        if system == "Windows":
-            ffprobe_path = ffmpeg_path.replace("ffmpeg.exe", "ffprobe.exe")
-        else:
-            ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe")
+        ffprobe_path = get_ffprobe_path(ffmpeg_path)
         
         # Use ffprobe to get duration and FPS data
         probe_cmd = [
@@ -170,47 +176,103 @@ def get_video_info(ffmpeg_path, input_file):
             "duration": None
         }
 
+def get_stream_signature(ffprobe_path, input_file):
+    """Return (video_signature, audio_signature) lists describing a file's streams"""
+    probe_cmd = [
+        ffprobe_path,
+        "-v", "error",
+        "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels",
+        "-of", "json",
+        input_file
+    ]
+    data = json.loads(subprocess.check_output(probe_cmd, universal_newlines=True))
+    
+    video_sig, audio_sig = [], []
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video":
+            video_sig.append((stream.get("codec_name"), stream.get("width"), stream.get("height"), stream.get("r_frame_rate")))
+        elif stream.get("codec_type") == "audio":
+            audio_sig.append((stream.get("codec_name"), stream.get("sample_rate"), stream.get("channels")))
+    return video_sig, audio_sig
+
+def check_combine_compatibility(ffmpeg_path, video_names):
+    """Compare every file's stream layout against the first file.
+    Returns (video_issues, audio_issues), or None if the files could not be probed."""
+    ffprobe_path = get_ffprobe_path(ffmpeg_path)
+    try:
+        signatures = [get_stream_signature(ffprobe_path, name) for name in video_names]
+    except Exception as e:
+        print(f"Could not verify file compatibility: {str(e)}")
+        return None
+    
+    base_video, base_audio = signatures[0]
+    video_issues, audio_issues = [], []
+    for name, (video_sig, audio_sig) in zip(video_names[1:], signatures[1:]):
+        if video_sig != base_video:
+            video_issues.append(f"'{name}' has different video settings (codec/resolution/frame rate) than '{video_names[0]}'")
+        if audio_sig != base_audio:
+            audio_issues.append(f"'{name}' has different audio settings (codec/sample rate/channels) than '{video_names[0]}'")
+    return video_issues, audio_issues
+
 def create_progress_bar(progress, width=20):
     """Create a simple text-based progress bar"""
     filled_width = int(width * progress / 100)
     bar = '█' * filled_width + '░' * (width - filled_width)
     return bar
 
-def encode_video(video_name, input_path, output_path, encoding_command, crf, preset, keyframe_interval, gpu_acceleration, max_bitrate=None):
-    """Core encoding function with progress monitoring and time remaining calculation"""
-    input_file = os.path.join(input_path, video_name)
-    output_file = os.path.join(output_path, f"{Path(video_name).stem} encoded av1.mkv")
-    
-    if not os.path.isfile(input_file):
-        print(f"Input not found: {input_file}")
-        return None, None
+MIN_PROGRESS_WIDTH = 90  # Columns needed to show the full two-line progress display
 
-    # Get video information before encoding
-    print("Analyzing video to calculate total frames...")
-    video_info = get_video_info(ffmpeg_path, input_file)
-    total_frames = video_info["frame_count"]
-    video_fps = video_info["fps"]
-    
-    if total_frames:
-        print(f"Total frames: {total_frames}, FPS: {video_fps:.2f}")
-    else:
-        print("Could not determine total frames, time remaining will not be shown")
+class LiveDisplay:
+    """Redraws a block of 1-2 lines in place using ANSI cursor movement"""
+    def __init__(self):
+        self.lines_drawn = 0
+        if platform.system() == "Windows":
+            os.system("")  # Enables ANSI escape code support in the Windows console
 
-    # Base FFmpeg command
-    ffmpeg_cmd = [
-        ffmpeg_path, "-y", "-i", input_file, "-map", "0",
+    def update(self, lines):
+        # Re-read the width every tick so widening the window takes effect immediately
+        width = max(20, shutil.get_terminal_size((120, 20)).columns - 1)
+        clipped = [line[:width] for line in lines]
+        
+        out = "\r"
+        if self.lines_drawn > 1:
+            out = f"\033[{self.lines_drawn - 1}A\r"  # Move back up to the first line of the block
+        out += "\n".join(f"{line}\033[K" for line in clipped)  # \033[K clears leftovers on each line
+        
+        # If the block shrank (2 lines -> 1), clear the line that's no longer used
+        extra = self.lines_drawn - len(clipped)
+        if extra > 0:
+            out += ("\n\033[K" * extra) + f"\033[{extra}A"
+        
+        sys.stdout.write(out)
+        sys.stdout.flush()
+        self.lines_drawn = len(clipped)
+
+    def finish(self):
+        """End the current block so normal printing starts on a fresh line"""
+        if self.lines_drawn:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        self.lines_drawn = 0
+
+def build_ffmpeg_command(input_args, output_file, encoding_command, crf, preset, keyframe_interval, gpu_acceleration, max_bitrate, audio_args):
+    """Build the FFmpeg command shared by single-file and combined encodes"""
+    ffmpeg_cmd = [ffmpeg_path, "-y"]
+
+    # -hwaccel is an input option, so it must come before the input arguments
+    if gpu_acceleration:
+        ffmpeg_cmd += ["-hwaccel", "auto"]
+
+    ffmpeg_cmd += [
+        *input_args, "-map", "0",
         "-vf", "scale=1920:-1", 
         "-c:v", encoding_command,
         "-crf", str(crf),
         "-preset", str(preset),
         "-g", str(keyframe_interval),
         "-pix_fmt", "yuv420p10le",
-        "-c:a", "copy"
+        *audio_args
     ]
-
-    # Add GPU acceleration if available
-    if gpu_acceleration:
-        ffmpeg_cmd += ["-hwaccel", "auto"]
 
     # SVT-AV1 specific parameters
     if encoding_command == "libsvtav1":
@@ -219,11 +281,21 @@ def encode_video(video_name, input_path, output_path, encoding_command, crf, pre
         ffmpeg_cmd += ["-svtav1-params", svtav1_params]
 
     ffmpeg_cmd.append(output_file)
+    return ffmpeg_cmd
 
+def run_ffmpeg_with_progress(ffmpeg_cmd, output_file, total_frames, video_fps, total_duration):
+    """Run FFmpeg with real-time progress display. Returns True on success."""
+    display = LiveDisplay()
     try:
         # Convert all elements to strings to prevent type errors
         ffmpeg_cmd_str = [str(item) for item in ffmpeg_cmd]
         print(f"Starting FFmpeg process with command: {' '.join(ffmpeg_cmd_str)}")
+        
+        # Warn right above the progress display if the window is too narrow to show it all
+        terminal_width = shutil.get_terminal_size((120, 20)).columns
+        if terminal_width < MIN_PROGRESS_WIDTH:
+            print(f"Note: this window is {terminal_width} columns wide, but the progress display needs about "
+                  f"{MIN_PROGRESS_WIDTH}. Widen the window to see everything (until then, lines are cut off at the edge).")
         
         # Use subprocess.Popen with appropriate redirects for real-time output
         process = subprocess.Popen(
@@ -304,45 +376,146 @@ def encode_video(video_name, input_path, output_path, encoding_command, crf, pre
                         else:
                             estimated_final_size_mb = 0
                         # Format video duration properly
-                        video_duration_formatted = format_duration(video_info["duration"])
-                        # Format a fixed-width progress display with additional information
-                        enhanced_progress = (
-                            f"\rFrame: {current_frame:6d}/{total_frames:6d} | "
+                        video_duration_formatted = format_duration(total_duration)
+                        
+                        # Two fixed-width lines, each about 85 characters
+                        line_one = (
+                            f"Frame: {current_frame:6d}/{total_frames:6d} | "
                             f"{progress_bar} {progress_percent:5.1f}% | "
+                            f"Encoded: {encoded_time} / {video_duration_formatted}"
+                        )
+                        line_two = (
                             f"{current_fps:3d}fps | "
                             f"{encoding_speed:3.1f}x | "
                             f"Bitrate: {current_bitrate:6.1f}kb/s | "
                             f"{current_size_mb:5.1f}MB / est. {estimated_final_size_mb:6.1f}MB | "
-                            f"Encoded: {encoded_time} / {video_duration_formatted} | "
                             f"est. {time_remaining} remaining"
-                            
                         )
-                        # Keep the line on the same line with carriage return
-                        print(enhanced_progress, end='', flush=True)
+                        display.update([line_one, line_two])
                     else:
-                        # If we couldn't calculate time remaining, just print the original line
-                        print(f"\r{line}", end='', flush=True)
+                        # If we couldn't calculate time remaining, just show the original line
+                        display.update([line])
                 else:
-                    # Other output on new lines
+                    # Other output goes on its own lines, below any progress block
+                    display.finish()
                     print(line)
         
         # Get return code
         return_code = process.poll()
         if return_code != 0:
             print(f"\nFFmpeg process exited with error code {return_code}")
-            return None, None
+            return False
         
         # Final status report
         print("\nEncoding completed")
-        return (output_file, calculate_size_reduction(input_file, output_file)) if os.path.exists(output_file) else (None, None)
+        return True
     
     except Exception as e:
+        display.finish()
         print(f"Encoding failed: {str(e)}")
+        return False
+
+def encode_video(video_name, input_path, output_path, encoding_command, crf, preset, keyframe_interval, gpu_acceleration, max_bitrate=None):
+    """Core encoding function with progress monitoring and time remaining calculation"""
+    input_file = os.path.join(input_path, video_name)
+    output_file = os.path.join(output_path, f"{Path(video_name).stem} encoded av1.mkv")
+    
+    if not os.path.isfile(input_file):
+        print(f"Input not found: {input_file}")
         return None, None
 
+    # Get video information before encoding
+    print("Analyzing video to calculate total frames...")
+    video_info = get_video_info(ffmpeg_path, input_file)
+    total_frames = video_info["frame_count"]
+    video_fps = video_info["fps"]
+    
+    if total_frames:
+        print(f"Total frames: {total_frames}, FPS: {video_fps:.2f}")
+    else:
+        print("Could not determine total frames, time remaining will not be shown")
+
+    ffmpeg_cmd = build_ffmpeg_command(
+        ["-i", input_file], output_file, encoding_command, crf, preset,
+        keyframe_interval, gpu_acceleration, max_bitrate, ["-c:a", "copy"]
+    )
+
+    if not run_ffmpeg_with_progress(ffmpeg_cmd, output_file, total_frames, video_fps, video_info["duration"]):
+        return None, None
+    
+    return (output_file, calculate_size_reduction(input_file, output_file)) if os.path.exists(output_file) else (None, None)
+
+def write_concat_list(input_files):
+    """Write an FFmpeg concat-demuxer list file (in the given order) and return its path"""
+    list_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+    try:
+        for file_path in input_files:
+            # Forward slashes work on every platform; single quotes must be escaped for the list syntax
+            escaped = Path(os.path.abspath(file_path)).as_posix().replace("'", "'\\''")
+            list_file.write(f"file '{escaped}'\n")
+    finally:
+        list_file.close()
+    return list_file.name
+
+def encode_combined(video_names, input_path, output_path, output_name, encoding_command, crf, preset, keyframe_interval, gpu_acceleration, max_bitrate, audio_args):
+    """Append all videos in order and encode them as one output file in a single pass"""
+    input_files = [os.path.join(input_path, name) for name in video_names]
+    output_file = os.path.join(output_path, output_name)
+    
+    for file_path in input_files:
+        if not os.path.isfile(file_path):
+            print(f"Input not found: {file_path}")
+            return None, None
+
+    # Sum frames and duration across every file so progress/ETA cover the whole combined video
+    print("Analyzing videos to calculate combined total frames...")
+    total_frames = 0
+    total_duration = 0.0
+    video_fps = None
+    info_complete = True
+    for file_path in input_files:
+        info = get_video_info(ffmpeg_path, file_path)
+        if video_fps is None:
+            video_fps = info["fps"]
+        if info["frame_count"] and info["duration"]:
+            total_frames += info["frame_count"]
+            total_duration += info["duration"]
+        else:
+            info_complete = False
+    
+    if not info_complete:
+        total_frames = None
+        total_duration = None
+    
+    if total_frames:
+        print(f"Combined total frames: {total_frames}, FPS: {video_fps:.2f}")
+    else:
+        print("Could not determine total frames, time remaining will not be shown")
+
+    list_path = write_concat_list(input_files)
+    try:
+        ffmpeg_cmd = build_ffmpeg_command(
+            ["-f", "concat", "-safe", "0", "-i", list_path], output_file, encoding_command, crf, preset,
+            keyframe_interval, gpu_acceleration, max_bitrate, audio_args
+        )
+        success = run_ffmpeg_with_progress(ffmpeg_cmd, output_file, total_frames, video_fps, total_duration)
+    finally:
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
+    
+    if not success or not os.path.exists(output_file):
+        return None, None
+
+    source_list = "\n".join(f"  {i}. {name}" for i, name in enumerate(video_names, 1))
+    log = f"Combined from (in order):\n{source_list}\n\n{calculate_size_reduction(input_files, output_file)}"
+    return output_file, log
+
 def calculate_size_reduction(original, encoded):
-    """Calculate and format file size reduction statistics"""
-    original_size = os.path.getsize(original)
+    """Calculate and format file size reduction statistics (original may be one path or a list)"""
+    originals = original if isinstance(original, (list, tuple)) else [original]
+    original_size = sum(os.path.getsize(path) for path in originals)
     encoded_size = os.path.getsize(encoded)
     reduction = (original_size - encoded_size) / original_size * 100
     
@@ -371,6 +544,26 @@ def get_recycle_bin_path():
     else:  # Linux
         return os.path.join(Path.home(), ".local", "share", "Trash", "files")
 
+def move_original_to_recycle_bin(video_name, input_path):
+    """Move an original video into the platform-appropriate recycle bin directory"""
+    try:
+        # Get platform-appropriate recycle bin path
+        recycle_bin_dir = get_recycle_bin_path()
+        os.makedirs(recycle_bin_dir, exist_ok=True)
+        
+        original_file = os.path.join(input_path, video_name)
+        destination_file = os.path.join(recycle_bin_dir, video_name)
+        
+        # If a file with the same name exists in the recycle bin, add a suffix
+        if os.path.exists(destination_file):
+            base, ext = os.path.splitext(video_name)
+            destination_file = os.path.join(recycle_bin_dir, f"{base}_old{ext}")
+        
+        shutil.move(original_file, destination_file)
+        print(f"Moved '{video_name}' to the recycle bin at: {recycle_bin_dir}")
+    except Exception as e:
+        print(f"Move failed: {e}")
+
 def encode_and_log(video_name, input_path, output_path, encoding_command, crf, preset, keyframe_interval, gpu_acceleration, max_bitrate, move_to_recycle_bin):
     """Handle encoding lifecycle with logging and file management"""
     output_file, log = encode_video(video_name, input_path, output_path, encoding_command, crf, preset, keyframe_interval, gpu_acceleration, max_bitrate)
@@ -381,27 +574,30 @@ def encode_and_log(video_name, input_path, output_path, encoding_command, crf, p
             log_file.write(log)
         
         if move_to_recycle_bin:
-            try:
-                # Get platform-appropriate recycle bin path
-                recycle_bin_dir = get_recycle_bin_path()
-                os.makedirs(recycle_bin_dir, exist_ok=True)
-                
-                original_file = os.path.join(input_path, video_name)
-                destination_file = os.path.join(recycle_bin_dir, video_name)
-                
-                # If a file with the same name exists in the recycle bin, add a suffix
-                if os.path.exists(destination_file):
-                    base, ext = os.path.splitext(video_name)
-                    destination_file = os.path.join(recycle_bin_dir, f"{base}_old{ext}")
-                
-                shutil.move(original_file, destination_file)
-                print(f"Moved '{video_name}' to the recycle bin at: {recycle_bin_dir}")
-            except Exception as e:
-                print(f"Move failed: {e}")
+            move_original_to_recycle_bin(video_name, input_path)
+
+def encode_and_log_combined(video_names, input_path, output_path, output_name, encoding_command, crf, preset, keyframe_interval, gpu_acceleration, max_bitrate, audio_args, move_to_recycle_bin):
+    """Combined-file equivalent of encode_and_log. Originals are only moved if the combined encode succeeds."""
+    output_file, log = encode_combined(video_names, input_path, output_path, output_name, encoding_command, crf, preset, keyframe_interval, gpu_acceleration, max_bitrate, audio_args)
+    
+    if output_file and log:
+        log_file_path = os.path.join(output_path, f"{Path(output_file).stem}.log")
+        with open(log_file_path, "w", encoding="utf-8") as log_file:
+            log_file.write(log)
+        
+        if move_to_recycle_bin:
+            for video_name in video_names:
+                move_original_to_recycle_bin(video_name, input_path)
+
+def build_audio_args(audio_mode, opus_bitrate):
+    """Return the FFmpeg audio arguments for the chosen audio handling"""
+    if audio_mode == "opus":
+        return ["-c:a", "libopus", "-b:a", f"{opus_bitrate}k"]
+    return ["-c:a", "copy"]
 
 # Main execution flow
 if __name__ == "__main__":
-    print("Cross-Platform Video Encoding Tool v2.2 - Supports HEVC/AV1 Conversion")
+    print("Cross-Platform Video Encoding Tool v2.3 - Supports HEVC/AV1 Conversion")
     print("--------------------------------------------------------")
     print("This tool will help you convert video files to efficient AV1 or HEVC format")
     print("with hardware acceleration when available.")
@@ -461,8 +657,44 @@ if __name__ == "__main__":
     else:
         sys.exit("Invalid encoding choice. Please restart and select either HEVC or AV1.")
 
+    # Optional: combine all videos into one file
+    combine = False
+    combined_name = None
+    audio_mode = "copy"
+    opus_bitrate = 128
+    
+    print("\nSTEP 3: Combine videos (optional)")
+    if len(videos) < 2:
+        print("Skipped - only one video was provided.")
+    else:
+        print("All listed videos can be joined into ONE encoded file, in this order:")
+        for i, name in enumerate(videos, 1):
+            print(f"  {i}. {name}")
+        print("This works best for continuous recordings that were auto-split (e.g., by OBS),")
+        print("where the end of one file picks up right where the next one begins.")
+        combine = input("Combine all videos into a single file? (Y/N) [N]: ").strip().upper() == "Y"
+        
+        if combine:
+            default_name = f"{Path(videos[0]).stem} combined {encoding.lower()}.mkv"
+            print("\nThe combined file will be saved in the current directory.")
+            combined_name = input(f"Output filename [{default_name}]: ").strip() or default_name
+            if not Path(combined_name).suffix:
+                combined_name += ".mkv"
+            
+            print("\nAudio handling for the combined file:")
+            print("  copy - keep the original audio untouched (fastest, no quality loss).")
+            print("         Best for auto-split files, which share identical audio settings.")
+            print("  opus - re-encode audio to Opus (use if the files have different audio settings,")
+            print("         or if you want smaller audio).")
+            audio_mode = input("Audio handling (copy/opus) [copy]: ").strip().lower() or "copy"
+            if audio_mode not in ("copy", "opus"):
+                print("Unrecognized choice, using copy.")
+                audio_mode = "copy"
+            if audio_mode == "opus":
+                opus_bitrate = get_validated_integer_input("Opus bitrate per audio track (kb/s)", 128, 32, 512)
+
     # System setup
-    print("\nSTEP 3: System configuration")
+    print("\nSTEP 4: System configuration")
     ffmpeg_path = find_ffmpeg_path()
     gpu_available = check_gpu_acceleration(ffmpeg_path)
     
@@ -473,10 +705,42 @@ if __name__ == "__main__":
         recycle_path = get_recycle_bin_path()
         print(f"Original files will be moved to: {recycle_path}")
 
-    # Process each video
-    print("\nSTEP 4: Beginning conversion process")
-    for i, video in enumerate(videos):
-        print(f"\nProcessing file {i+1}/{len(videos)}: {video}")
-        encode_and_log(video, os.getcwd(), os.getcwd(), codec, crf, preset, keyframe, gpu_available, max_bitrate, recycle)
+    # Verify the files can be safely joined before starting a long encode
+    if combine:
+        print("\nChecking that the files are compatible for combining...")
+        issues = check_combine_compatibility(ffmpeg_path, videos)
+        if issues is None:
+            print("Continuing with your chosen settings.")
+        else:
+            video_issues, audio_issues = issues
+            
+            if audio_issues and audio_mode == "copy":
+                for issue in audio_issues:
+                    print(f"Warning: {issue}")
+                print("Audio can't be copied reliably when settings differ, so audio will be re-encoded to Opus instead.")
+                audio_mode = "opus"
+                opus_bitrate = get_validated_integer_input("Opus bitrate per audio track (kb/s)", 128, 32, 512)
+            
+            if video_issues:
+                for issue in video_issues:
+                    print(f"Warning: {issue}")
+                print("Joining files with different video settings may cause glitches at the join points.")
+                if input("Combine anyway? (Y/N) [N]: ").strip().upper() != "Y":
+                    print("Combining cancelled. The files will be encoded separately instead.")
+                    combine = False
+            
+            if combine and not video_issues and not audio_issues:
+                print("All files are compatible.")
+
+    # Process videos
+    print("\nSTEP 5: Beginning conversion process")
+    if combine:
+        audio_args = build_audio_args(audio_mode, opus_bitrate)
+        print(f"\nCombining {len(videos)} files into: {combined_name}")
+        encode_and_log_combined(videos, os.getcwd(), os.getcwd(), combined_name, codec, crf, preset, keyframe, gpu_available, max_bitrate, audio_args, recycle)
+    else:
+        for i, video in enumerate(videos):
+            print(f"\nProcessing file {i+1}/{len(videos)}: {video}")
+            encode_and_log(video, os.getcwd(), os.getcwd(), codec, crf, preset, keyframe, gpu_available, max_bitrate, recycle)
     
     print("\nAll processing complete! Encoded files have been saved to the current directory.")
